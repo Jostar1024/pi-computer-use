@@ -24,6 +24,7 @@ The benchmark answers four questions:
 4. **Coverage**
    - baseline/frontmost
    - native apps (`TextEdit`, `Finder`, `Reminders`)
+   - hybrid/WebView apps (`Slack`, `Discord`, `Visual Studio Code`, `Cursor`, `Figma` when available)
    - browsers (`Safari`, `Chrome`, `Firefox`, `Helium`, etc. when available)
    - expanded TextEdit action surface (`set_text`, raw keyboard/pointer primitives, and `computer_actions`)
 
@@ -63,8 +64,21 @@ The benchmark prints a JSON report containing:
 
 - environment metadata
 - aggregate metrics
+- improvement analysis (`analysis`)
 - optional baseline comparison
 - per-case records
+
+The `analysis` section is intended to show where to improve next:
+
+- `analysis.byApp` summarizes pass/fail, AX-only, vision fallback, target count, and latency per app.
+- `analysis.bottlenecks.sparseSemanticCoverage` lists passing cases with fewer than 3 AX targets or image fallback.
+- `analysis.bottlenecks.visionFallbackCases` lists cases that needed attached screenshots and their `imageReason`.
+- `analysis.bottlenecks.nonAxTargetingCases` lists targeting/action cases that did not execute through AX.
+- `analysis.bottlenecks.skippedCapabilities` lists missing frontier capabilities, such as absent AX scroll or adjustable refs.
+- `analysis.bottlenecks.slowestCases` highlights latency hot spots.
+- `analysis.buckets` groups AX diagnostic reasons, image fallback reasons, failures, and skips.
+
+Per-case records also include `imageReason`, `axDiagnosticReason`, `axDiagnosticMessage`, and `axRoles` when the tool result exposes those diagnostics.
 
 Important metrics:
 
@@ -72,6 +86,21 @@ Important metrics:
 - `coreAxOnlyRatio`
 - `visionFallbackRatio`
 - `coreVisionFallbackRatio`
+- `semanticCoverageRatio`
+- `coreSemanticCoverageRatio`
+- `sparseSemanticCoverageRatio`
+- `coreSparseSemanticCoverageRatio`
+- `avgAxTargets`
+- `coreAvgAxTargets`
+- `hybridSemanticCoverageRatio`
+- `hybridSparseSemanticCoverageRatio`
+- `hybridVisionFallbackRatio`
+- `hybridAvgAxTargets`
+- `zeroAxTargetCaseCount`
+- `sparseSemanticCoverageCaseCount`
+- `visionFallbackCaseCount`
+- `nonAxTargetingCaseCount`
+- `skippedCapabilityCount`
 - `axExecutionRatio`
 - `stealthCompatibleRatio`
 - `navigationAxOnlyRatio`
@@ -86,7 +115,7 @@ Important metrics:
 - `avgPrimitiveLatencyMs`
 - `avgBatchLatencyMs`
 
-`core*` metrics exclude frontier capability probes so experimental coverage does not hide regressions in the main user path.
+`core*` metrics exclude frontier capability probes and hybrid-app diagnostic cases so experimental coverage does not hide regressions in the main user path. Hybrid coverage is tracked separately via `hybrid*` metrics.
 
 `axExecutionRatio` and `targetingAxOnlyRatio` intentionally track AX-first targeting actions (`click` and `set_text`). Raw primitives such as `keypress`, `drag`, and `scroll` are measured separately so improved primitive coverage does not hide AX-first targeting regressions.
 

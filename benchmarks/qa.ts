@@ -39,10 +39,12 @@ const HELPER_PATH = path.join(os.homedir(), ".pi", "agent", "helpers", "pi-compu
 const HELPER_SOURCE_PATH = path.resolve(process.cwd(), "native/macos/bridge.swift");
 
 const BROWSER_APPS = ["Safari", "Google Chrome", "Chrome", "Chromium", "Firefox", "Helium", "Arc", "Brave Browser", "Microsoft Edge"];
+const HYBRID_APPS = ["Slack", "Discord", "Visual Studio Code", "Cursor", "Figma"];
 const MATRIX = [
 	{ app: "TextEdit", category: "native" },
 	{ app: "Finder", category: "native" },
 	{ app: "Reminders", category: "native" },
+	...HYBRID_APPS.map((app) => ({ app, category: "hybrid" })),
 	...BROWSER_APPS.map((app) => ({ app, category: "browser" })),
 ];
 
@@ -73,6 +75,10 @@ type CaseRecord = {
 	executionVariant?: string;
 	details?: string;
 	capability?: string;
+	imageReason?: string;
+	axDiagnosticReason?: string;
+	axDiagnosticMessage?: string;
+	axRoles?: Record<string, number>;
 };
 
 type BenchmarkSummary = {
@@ -82,6 +88,7 @@ type BenchmarkSummary = {
 	host: string;
 	cwd: string;
 	metrics: ReturnType<typeof metrics>;
+	analysis: ReturnType<typeof analyzeRecords>;
 	goals?: {
 		status: "PASS" | "FAIL";
 		checks: Array<{ metric: string; current: number; target: number; status: "PASS" | "FAIL"; details: string }>;
@@ -115,12 +122,17 @@ function runningApps(): Set<string> {
 	}
 }
 
+function metricHigherIsBetter(metric: string): boolean {
+	if (/Fallback|Sparse|Skipped|Failed|Latency|slowest|Count$/i.test(metric)) return false;
+	return /Ratio$|avgAxTargets|AxTargets/i.test(metric);
+}
+
 function goalStatus(current: ReturnType<typeof metrics>) {
 	const goals = readJsonFile(CONFIG_PATH)?.goals ?? {};
 	const checks = Object.entries(goals).map(([metric, target]) => {
 		const currentValue = Number((current as any)[metric] ?? 0);
 		const goalValue = Number(target ?? 0);
-		const higherIsBetter = ["axOnlyRatio", "coreAxOnlyRatio", "capabilityPassRatio", "capabilityStealthRatio"].includes(metric);
+		const higherIsBetter = metricHigherIsBetter(metric);
 		const status = higherIsBetter ? currentValue >= goalValue : currentValue <= goalValue;
 		const details = higherIsBetter ? `expected >= ${goalValue}, got ${currentValue}` : `expected <= ${goalValue}, got ${currentValue}`;
 		return { metric, current: currentValue, target: goalValue, status: (status ? "PASS" : "FAIL") as "PASS" | "FAIL", details };
@@ -130,15 +142,15 @@ function goalStatus(current: ReturnType<typeof metrics>) {
 
 function compareMetrics(current: ReturnType<typeof metrics>, baseline: ReturnType<typeof metrics>) {
 	const config = readJsonFile(CONFIG_PATH)?.regressionTolerance ?? {};
-	const higherIsBetter = new Set(["axOnlyRatio", "coreAxOnlyRatio", "axExecutionRatio", "navigationAxOnlyRatio", "targetingAxOnlyRatio", "capabilityPassRatio", "capabilityStealthRatio"]);
 	const checks = Object.entries(config).map(([metric, tolerance]) => {
 		const currentValue = Number((current as any)[metric] ?? 0);
 		const baselineValue = Number((baseline as any)[metric] ?? 0);
 		const allowed = Number(tolerance ?? 0);
-		const status = higherIsBetter.has(metric)
+		const higherIsBetter = metricHigherIsBetter(metric);
+		const status = higherIsBetter
 			? currentValue + allowed >= baselineValue
 			: currentValue <= baselineValue + allowed;
-		const details = higherIsBetter.has(metric)
+		const details = higherIsBetter
 			? `expected >= ${baselineValue - allowed}, got ${currentValue}`
 			: `expected <= ${baselineValue + allowed}, got ${currentValue}`;
 		return { metric, current: currentValue, baseline: baselineValue, status: (status ? "PASS" : "FAIL") as "PASS" | "FAIL", details };
@@ -241,9 +253,24 @@ function prepareAppWindow(appName: string): void {
 	}
 }
 
-function summarizeResult(result: any): { hasImage: boolean; axTargets: number; fallbackUsed: boolean; axExecution: boolean; stealthCompatible: boolean; executionVariant: string } {
+function summarizeResult(result: any): {
+	hasImage: boolean;
+	axTargets: number;
+	fallbackUsed: boolean;
+	axExecution: boolean;
+	stealthCompatible: boolean;
+	executionVariant: string;
+	imageReason?: string;
+	axDiagnosticReason?: string;
+	axDiagnosticMessage?: string;
+	axRoles?: Record<string, number>;
+} {
 	const content = Array.isArray(result?.content) ? result.content : [];
 	const details = result?.details ?? {};
+	const roleCounts = details?.axDiagnostics?.debug?.roleCounts;
+	const axRoles = roleCounts && typeof roleCounts === "object" && !Array.isArray(roleCounts)
+		? Object.fromEntries(Object.entries(roleCounts).map(([role, count]) => [role, Number(count) || 0]))
+		: undefined;
 	return {
 		hasImage: content.some((item: any) => item?.type === "image"),
 		axTargets: Array.isArray(details?.axTargets) ? details.axTargets.length : 0,
@@ -251,6 +278,10 @@ function summarizeResult(result: any): { hasImage: boolean; axTargets: number; f
 		axExecution: details?.execution?.axSucceeded === true || String(details?.execution?.strategy ?? "").startsWith("ax_"),
 		stealthCompatible: details?.execution?.stealthCompatible === true,
 		executionVariant: String(details?.execution?.variant ?? "unknown"),
+		imageReason: typeof details?.imageReason === "string" ? details.imageReason : undefined,
+		axDiagnosticReason: typeof details?.axDiagnostics?.reason === "string" ? details.axDiagnostics.reason : undefined,
+		axDiagnosticMessage: typeof details?.axDiagnostics?.message === "string" ? details.axDiagnostics.message : undefined,
+		axRoles,
 	};
 }
 
@@ -297,10 +328,13 @@ function captureCenter(details: any): { x: number; y: number } {
 }
 
 function metrics(records: CaseRecord[]) {
-	const coreRecords = records.filter((record) => !record.capability);
+	const coreRecords = records.filter((record) => !record.capability && record.category !== "hybrid");
 	const executed = records.filter((record) => record.status !== "SKIP");
 	const coreExecuted = coreRecords.filter((record) => record.status !== "SKIP");
 	const passed = executed.filter((record) => record.status === "PASS");
+	const corePassed = coreExecuted.filter((record) => record.status === "PASS");
+	const semanticCoverageOk = (record: CaseRecord) => record.status === "PASS" && record.hasImage !== true && (record.axTargets ?? 0) >= 3;
+	const sparseSemanticCoverage = (record: CaseRecord) => record.status === "PASS" && (record.hasImage === true || (record.axTargets ?? 0) < 3);
 	const navigation = executed.filter((record) => record.tool === "screenshot" || record.tool === "wait");
 	const targeting = executed.filter((record) => record.tool === "click" || record.tool === "set_text");
 	const primitives = executed.filter((record) =>
@@ -315,20 +349,35 @@ function metrics(records: CaseRecord[]) {
 		subset.length
 			? Math.round(subset.reduce((sum, record) => sum + (record.latencyMs ?? 0), 0) / subset.length)
 			: 0;
+	const avgAxTargets = (subset: CaseRecord[]) =>
+		subset.length
+			? Number((subset.reduce((sum, record) => sum + (record.axTargets ?? 0), 0) / subset.length).toFixed(1))
+			: 0;
 	const byCategory = Object.fromEntries(
 		Array.from(new Set(records.map((record) => record.category))).map((category) => {
 			const subset = records.filter((record) => record.category === category);
+			const subsetExecuted = subset.filter((record) => record.status !== "SKIP");
 			return [
 				category,
 				{
 					total: subset.length,
-					executed: subset.filter((record) => record.status !== "SKIP").length,
+					executed: subsetExecuted.length,
 					passed: subset.filter((record) => record.status === "PASS").length,
+					failed: subset.filter((record) => record.status === "FAIL").length,
 					skipped: subset.filter((record) => record.status === "SKIP").length,
+					axOnlyRatio: ratio(subsetExecuted, (record) => record.axOnly === true),
+					visionFallbackRatio: ratio(subsetExecuted, (record) => record.hasImage === true),
+					semanticCoverageRatio: ratio(subset.filter((record) => record.status === "PASS"), semanticCoverageOk),
+					sparseSemanticCoverageRatio: ratio(subset.filter((record) => record.status === "PASS"), sparseSemanticCoverage),
+					stealthCompatibleRatio: ratio(subsetExecuted, (record) => record.stealthCompatible === true),
+					avgAxTargets: avgAxTargets(subset.filter((record) => record.status === "PASS")),
+					avgLatencyMs: avgLatency(subsetExecuted),
 				},
 			];
 		}),
 	);
+	const hybridPassed = passed.filter((record) => record.category === "hybrid");
+	const hybridExecuted = executed.filter((record) => record.category === "hybrid");
 	return {
 		total: records.length,
 		executed: executed.length,
@@ -339,6 +388,21 @@ function metrics(records: CaseRecord[]) {
 		coreAxOnlyRatio: ratio(coreExecuted, (record) => record.axOnly === true),
 		visionFallbackRatio: ratio(executed, (record) => record.hasImage === true),
 		coreVisionFallbackRatio: ratio(coreExecuted, (record) => record.hasImage === true),
+		semanticCoverageRatio: ratio(passed, semanticCoverageOk),
+		coreSemanticCoverageRatio: ratio(corePassed, semanticCoverageOk),
+		sparseSemanticCoverageRatio: ratio(passed, sparseSemanticCoverage),
+		coreSparseSemanticCoverageRatio: ratio(corePassed, sparseSemanticCoverage),
+		avgAxTargets: avgAxTargets(passed),
+		coreAvgAxTargets: avgAxTargets(corePassed),
+		hybridSemanticCoverageRatio: ratio(hybridPassed, semanticCoverageOk),
+		hybridSparseSemanticCoverageRatio: ratio(hybridPassed, sparseSemanticCoverage),
+		hybridVisionFallbackRatio: ratio(hybridExecuted, (record) => record.hasImage === true),
+		hybridAvgAxTargets: avgAxTargets(hybridPassed),
+		zeroAxTargetCaseCount: passed.filter((record) => (record.axTargets ?? 0) === 0).length,
+		sparseSemanticCoverageCaseCount: passed.filter(sparseSemanticCoverage).length,
+		visionFallbackCaseCount: passed.filter((record) => record.hasImage === true).length,
+		nonAxTargetingCaseCount: passed.filter((record) => ["click", "set_text", "scroll", "drag"].includes(record.tool) && record.axExecution !== true).length,
+		skippedCapabilityCount: capabilities.filter((record) => record.status === "SKIP").length,
 		axExecutionRatio: ratio(targeting, (record) => record.axExecution === true && record.fallbackUsed !== true),
 		stealthCompatibleRatio: ratio(executed, (record) => record.stealthCompatible === true),
 		navigationAxOnlyRatio: ratio(navigation, (record) => record.axOnly === true),
@@ -355,6 +419,101 @@ function metrics(records: CaseRecord[]) {
 		avgPrimitiveLatencyMs: avgLatency(primitives),
 		avgBatchLatencyMs: avgLatency(batches),
 		coverage: byCategory,
+	};
+}
+
+function bucketCounts(values: Array<string | undefined>): Record<string, number> {
+	const buckets: Record<string, number> = {};
+	for (const value of values) {
+		const key = value?.trim() || "(none)";
+		buckets[key] = (buckets[key] ?? 0) + 1;
+	}
+	return Object.fromEntries(Object.entries(buckets).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])));
+}
+
+function compactCase(record: CaseRecord) {
+	return {
+		name: record.name,
+		app: record.app,
+		category: record.category,
+		tool: record.tool,
+		status: record.status,
+		latencyMs: record.latencyMs,
+		axTargets: record.axTargets,
+		hasImage: record.hasImage,
+		imageReason: record.imageReason,
+		axDiagnosticReason: record.axDiagnosticReason,
+		details: record.details,
+		capability: record.capability,
+	};
+}
+
+function analyzeRecords(records: CaseRecord[]) {
+	const executed = records.filter((record) => record.status !== "SKIP");
+	const passed = executed.filter((record) => record.status === "PASS");
+	const semanticCoverageOk = (record: CaseRecord) => record.status === "PASS" && record.hasImage !== true && (record.axTargets ?? 0) >= 3;
+	const sparseSemanticCoverage = (record: CaseRecord) => record.status === "PASS" && (record.hasImage === true || (record.axTargets ?? 0) < 3);
+	const byApp = Object.fromEntries(
+		Array.from(new Set(records.map((record) => record.app).filter((app): app is string => Boolean(app)))).map((app) => {
+			const subset = records.filter((record) => record.app === app);
+			const subsetExecuted = subset.filter((record) => record.status !== "SKIP");
+			const subsetPassed = subset.filter((record) => record.status === "PASS");
+			const ratio = (source: CaseRecord[], predicate: (record: CaseRecord) => boolean) =>
+				source.length ? Number((source.filter(predicate).length / source.length).toFixed(3)) : 0;
+			return [app, {
+				executed: subsetExecuted.length,
+				passed: subsetPassed.length,
+				failed: subset.filter((record) => record.status === "FAIL").length,
+				skipped: subset.filter((record) => record.status === "SKIP").length,
+				axOnlyRatio: ratio(subsetExecuted, (record) => record.axOnly === true),
+				visionFallbackRatio: ratio(subsetExecuted, (record) => record.hasImage === true),
+				semanticCoverageRatio: ratio(subsetPassed, semanticCoverageOk),
+				sparseSemanticCoverageRatio: ratio(subsetPassed, sparseSemanticCoverage),
+				avgAxTargets: subsetPassed.length ? Number((subsetPassed.reduce((sum, record) => sum + (record.axTargets ?? 0), 0) / subsetPassed.length).toFixed(1)) : 0,
+				avgLatencyMs: subsetExecuted.length ? Math.round(subsetExecuted.reduce((sum, record) => sum + (record.latencyMs ?? 0), 0) / subsetExecuted.length) : 0,
+			}];
+		}),
+	);
+	const sparseSemanticCoverageCases = passed
+		.filter(sparseSemanticCoverage)
+		.sort((a, b) => (a.axTargets ?? 0) - (b.axTargets ?? 0) || Number(b.hasImage) - Number(a.hasImage))
+		.map(compactCase);
+	const visionFallbackCases = passed
+		.filter((record) => record.hasImage === true)
+		.sort((a, b) => String(a.imageReason ?? "").localeCompare(String(b.imageReason ?? "")) || a.name.localeCompare(b.name))
+		.map(compactCase);
+	const nonAxTargetingCases = passed
+		.filter((record) => ["click", "set_text", "scroll", "drag"].includes(record.tool) && record.axExecution !== true)
+		.map(compactCase);
+	const skippedCapabilities = records
+		.filter((record) => record.status === "SKIP" && Boolean(record.capability))
+		.map(compactCase);
+	const failedCases = records
+		.filter((record) => record.status === "FAIL")
+		.map(compactCase);
+	const slowestCases = executed
+		.filter((record) => typeof record.latencyMs === "number")
+		.sort((a, b) => (b.latencyMs ?? 0) - (a.latencyMs ?? 0))
+		.slice(0, 10)
+		.map(compactCase);
+	const axDiagnosticReasons = bucketCounts(passed.map((record) => record.axDiagnosticReason));
+	const imageReasons = bucketCounts(passed.filter((record) => record.hasImage === true).map((record) => record.imageReason));
+	return {
+		byApp,
+		bottlenecks: {
+			sparseSemanticCoverage: sparseSemanticCoverageCases,
+			visionFallbackCases,
+			nonAxTargetingCases,
+			skippedCapabilities,
+			failedCases,
+			slowestCases,
+		},
+		buckets: {
+			axDiagnosticReasons,
+			imageReasons,
+			failureReasons: bucketCounts(failedCases.map((record) => record.details?.replace(/\d+/g, "#").slice(0, 160))),
+			skipReasons: bucketCounts(records.filter((record) => record.status === "SKIP").map((record) => record.details)),
+		},
 	};
 }
 
@@ -395,8 +554,12 @@ async function benchmarkCase(
 				fallbackUsed: summary.fallbackUsed,
 				stealthCompatible: summary.stealthCompatible,
 				executionVariant: summary.executionVariant,
-				details: `axTargets=${summary.axTargets} hasImage=${summary.hasImage} axExecution=${summary.axExecution} fallback=${summary.fallbackUsed} variant=${summary.executionVariant} stealthCompatible=${summary.stealthCompatible}`,
+				details: `axTargets=${summary.axTargets} hasImage=${summary.hasImage}${summary.imageReason ? ` imageReason=${summary.imageReason}` : ""} axExecution=${summary.axExecution} fallback=${summary.fallbackUsed} variant=${summary.executionVariant} stealthCompatible=${summary.stealthCompatible}${summary.axDiagnosticReason ? ` axDiagnostic=${summary.axDiagnosticReason}` : ""}`,
 				capability,
+				imageReason: summary.imageReason,
+				axDiagnosticReason: summary.axDiagnosticReason,
+				axDiagnosticMessage: summary.axDiagnosticMessage,
+				axRoles: summary.axRoles,
 			}),
 			result,
 		};
@@ -703,6 +866,7 @@ async function main() {
 		host: os.hostname(),
 		cwd: process.cwd(),
 		metrics: benchmarkMetrics,
+		analysis: analyzeRecords(records),
 		goals: goalStatus(benchmarkMetrics),
 		cases: records,
 	};
