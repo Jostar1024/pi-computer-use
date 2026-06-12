@@ -65,6 +65,17 @@ Build both release prebuilts for both helper variants:
 node scripts/build-native.mjs --arch all --variant all
 ```
 
+Release prebuilt helpers live at:
+
+```text
+prebuilt/macos/arm64/modern/bridge
+prebuilt/macos/arm64/legacy/bridge
+prebuilt/macos/x64/modern/bridge
+prebuilt/macos/x64/legacy/bridge
+```
+
+`setup-helper.mjs` selects `modern` on macOS 14+ and `legacy` on macOS 12/13, then copies the selected binary to `~/.pi/agent/helpers/pi-computer-use/bridge`.
+
 Local helper builds are ad-hoc codesigned by default. For release builds, use a Developer ID Application certificate:
 
 ```bash
@@ -90,34 +101,54 @@ For TypeScript and schema checks:
 npm test
 ```
 
-For behavior changes, run the QA benchmark:
+For documentation-only changes, proofreading markdown and checking touched links is usually enough.
+
+## Benchmarks
+
+Use benchmark output when changing semantic target ranking, fallback policy, AX execution, browser handling, native helper behavior, permission/setup behavior, or payload efficiency.
+
+The QA benchmark is a local Pi-extension harness, not a clone of CUAbench.ai/OSWorld/WebArena. It borrows their principles—task diversity, reset/cleanup, action efficiency, and regression checks—while measuring package-specific behavior: compact semantic AX results, selective image fallback, AX execution, latency, payload size, and optional CDP behavior.
+
+Default benchmark, non-intrusive aside from inspecting already-running visible apps:
 
 ```bash
 npm run benchmark:qa
 ```
 
-For wider coverage that may open apps:
+Wider coverage that may open apps. TextEdit/Finder artifacts created by the harness are cleaned up by default:
 
 ```bash
 npm run benchmark:qa:full
 ```
 
-For the CDP backend only (self-contained; launches a headless Chrome, needs no macOS permissions, and is also included in `benchmark:qa` runs):
+Browser tab/address-bar navigation is skipped by default. Run it only when you are okay with the active browser tab/window changing:
+
+```bash
+npx -y tsx benchmarks/qa.ts --allow-foreground-qa --allow-browser-navigation
+```
+
+Keep temporary benchmark windows/documents for debugging:
+
+```bash
+npx -y tsx benchmarks/qa.ts --allow-foreground-qa --allow-screen-takeover --leave-artifacts
+```
+
+Save and compare local results:
+
+```bash
+npx -y tsx benchmarks/qa.ts --allow-foreground-qa --output benchmarks/results/baseline.local.json
+npx -y tsx benchmarks/qa.ts --allow-foreground-qa --baseline benchmarks/results/baseline.local.json --output benchmarks/results/current.local.json
+```
+
+For the CDP backend only (self-contained; launches a headless Chrome, needs no macOS permissions, and is also included in `benchmark:qa` runs under a separate `cdp` category):
 
 ```bash
 npm run benchmark:cdp
 ```
 
-Use benchmark output when changing:
+Important metrics include AX-only ratio, vision fallback ratio, semantic coverage, AX execution ratio, latency, executed app/category/tool counts, and payload proxies (`avgTextChars`, `avgImageBytes`, `avgContentJsonBytes`, `avgDetailsJsonBytes`, `avgPayloadBytes`). In `benchmarkSchemaVersion: 2`, payload bytes are serialized `content` JSON plus serialized `details` JSON, not just text length.
 
-- semantic target ranking
-- fallback policy
-- AX execution
-- browser handling
-- native helper behavior
-- permission/setup behavior
-
-For documentation-only changes, proofreading markdown and checking touched links is usually enough.
+Current goals and regression tolerances live in `benchmarks/config.json`.
 
 ## Pull Requests
 

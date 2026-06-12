@@ -24,6 +24,10 @@ const ALLOW_FOREGROUND_QA =
 	process.argv.includes("--allow-foreground-qa") || process.env.PI_COMPUTER_USE_ALLOW_FOREGROUND_QA === "1";
 const ALLOW_SCREEN_TAKEOVER =
 	process.argv.includes("--allow-screen-takeover") || process.env.PI_COMPUTER_USE_ALLOW_SCREEN_TAKEOVER === "1";
+const LEAVE_ARTIFACTS =
+	process.argv.includes("--leave-artifacts") || process.env.PI_COMPUTER_USE_LEAVE_ARTIFACTS === "1";
+const ALLOW_BROWSER_NAVIGATION =
+	process.argv.includes("--allow-browser-navigation") || process.env.PI_COMPUTER_USE_ALLOW_BROWSER_NAVIGATION === "1";
 const STRICT_AX_MODE = process.env.PI_COMPUTER_USE_STEALTH === "1" || process.env.PI_COMPUTER_USE_STRICT_AX === "1";
 function argValue(name: string): string | undefined {
 	const exact = `${name}=`;
@@ -38,6 +42,7 @@ const BASELINE_PATH = argValue("--baseline");
 const CONFIG_PATH = path.resolve(process.cwd(), "benchmarks/config.json");
 const HELPER_PATH = path.join(os.homedir(), ".pi", "agent", "helpers", "pi-computer-use", "bridge");
 const HELPER_SOURCE_PATH = path.resolve(process.cwd(), "native/macos/bridge.swift");
+const BENCHMARK_SCHEMA_VERSION = 2;
 
 const BROWSER_APPS = ["Safari", "Google Chrome", "Chrome", "Chromium", "Firefox", "Helium", "Arc", "Brave Browser", "Microsoft Edge"];
 const HYBRID_APPS = ["Slack", "Discord", "Visual Studio Code", "Cursor", "Figma"];
@@ -81,12 +86,25 @@ type CaseRecord = {
 	axDiagnosticReason?: string;
 	axDiagnosticMessage?: string;
 	axRoles?: Record<string, number>;
+	/** Text characters returned to the model for this tool result. Proxy for token efficiency. */
+	textChars?: number;
+	/** Decoded image bytes returned in this tool result. */
+	imageBytes?: number;
+	/** Serialized JSON bytes for model-visible content items. */
+	contentJsonBytes?: number;
+	/** Serialized JSON bytes for structured details returned with the tool result. */
+	detailsJsonBytes?: number;
+	/** Approximate serialized tool-result payload size: content JSON + details JSON bytes. */
+	payloadBytes?: number;
 };
 
 type BenchmarkSummary = {
+	benchmarkSchemaVersion: number;
 	date: string;
 	strictAxMode: boolean;
 	allowScreenTakeover: boolean;
+	allowBrowserNavigation: boolean;
+	leaveArtifacts: boolean;
 	host: string;
 	cwd: string;
 	metrics: ReturnType<typeof metrics>;
@@ -125,6 +143,7 @@ function runningApps(): Set<string> {
 }
 
 function metricHigherIsBetter(metric: string): boolean {
+	if (/^(executedAppCount|executedCategoryCount|executedToolCount)$/i.test(metric)) return true;
 	if (/Fallback|Sparse|Skipped|Failed|Latency|slowest|Count$/i.test(metric)) return false;
 	return /Ratio$|avgAxTargets|AxTargets/i.test(metric);
 }
@@ -148,11 +167,16 @@ function goalStatus(current: ReturnType<typeof metrics>) {
 	return { status: (checks.every((check) => check.status === "PASS") ? "PASS" : "FAIL") as "PASS" | "FAIL", checks };
 }
 
-function compareMetrics(current: ReturnType<typeof metrics>, baseline: ReturnType<typeof metrics>) {
+function compareMetrics(current: ReturnType<typeof metrics>, baselineSummary: any) {
+	const baseline = baselineSummary?.metrics ?? baselineSummary;
+	const baselineSchemaVersion = Number(baselineSummary?.benchmarkSchemaVersion ?? 1);
 	const config = readJsonFile(CONFIG_PATH)?.regressionTolerance ?? {};
 	const checks = Object.entries(config).map(([metric, tolerance]) => {
 		const currentValue = Number((current as any)[metric] ?? 0);
 		const baselineValue = Number((baseline as any)[metric] ?? 0);
+		if (/Bytes|Chars/i.test(metric) && baselineSchemaVersion !== BENCHMARK_SCHEMA_VERSION) {
+			return { metric, current: currentValue, baseline: baselineValue, status: "PASS" as const, details: `skipped: payload metric schema changed from v${baselineSchemaVersion} to v${BENCHMARK_SCHEMA_VERSION}` };
+		}
 		const allowed = Number(tolerance ?? 0);
 		const higherIsBetter = metricHigherIsBetter(metric);
 		const status = higherIsBetter
@@ -246,18 +270,42 @@ function runAppleScript(lines: string[]): void {
 	runCommand("osascript", lines.flatMap((line) => ["-e", line]));
 }
 
-function prepareAppWindow(appName: string): void {
+function prepareAppWindow(appName: string): boolean {
 	if (appName === "TextEdit") {
 		runAppleScript([`tell application "TextEdit" to activate`, `tell application "TextEdit" to make new document`]);
-		return;
+		return true;
 	}
 	if (appName === "Finder") {
 		runAppleScript([`tell application "Finder" to activate`, `tell application "Finder" to make new Finder window to home`]);
-		return;
+		return true;
 	}
 	if (appName === "Reminders") {
 		runAppleScript([`tell application "Reminders" to activate`]);
-		return;
+		return false;
+	}
+	return false;
+}
+
+function cleanupBenchmarkArtifacts(preparedApps: Set<string>): void {
+	if (LEAVE_ARTIFACTS) return;
+	for (const appName of preparedApps) {
+		try {
+			if (appName === "TextEdit") {
+				runAppleScript([
+					`tell application "TextEdit"`,
+					`if (count of documents) > 0 then close front document saving no`,
+					`end tell`,
+				]);
+			} else if (appName === "Finder") {
+				runAppleScript([
+					`tell application "Finder"`,
+					`if (count of Finder windows) > 0 then close front Finder window`,
+					`end tell`,
+				]);
+			}
+		} catch {
+			// Best-effort cleanup only; benchmark scoring should not depend on AppleScript cleanup.
+		}
 	}
 }
 
@@ -272,9 +320,22 @@ function summarizeResult(result: any): {
 	axDiagnosticReason?: string;
 	axDiagnosticMessage?: string;
 	axRoles?: Record<string, number>;
+	textChars: number;
+	imageBytes: number;
+	contentJsonBytes: number;
+	detailsJsonBytes: number;
+	payloadBytes: number;
 } {
 	const content = Array.isArray(result?.content) ? result.content : [];
 	const details = result?.details ?? {};
+	const textChars = content
+		.filter((item: any) => item?.type === "text")
+		.reduce((sum: number, item: any) => sum + String(item?.text ?? "").length, 0);
+	const imageBytes = content
+		.filter((item: any) => item?.type === "image" && typeof item?.data === "string")
+		.reduce((sum: number, item: any) => sum + Math.floor(String(item.data).length * 3 / 4), 0);
+	const contentJsonBytes = Buffer.byteLength(JSON.stringify(content));
+	const detailsJsonBytes = Buffer.byteLength(JSON.stringify(details));
 	const roleCounts = details?.axDiagnostics?.debug?.roleCounts;
 	const axRoles = roleCounts && typeof roleCounts === "object" && !Array.isArray(roleCounts)
 		? Object.fromEntries(Object.entries(roleCounts).map(([role, count]) => [role, Number(count) || 0]))
@@ -290,6 +351,11 @@ function summarizeResult(result: any): {
 		axDiagnosticReason: typeof details?.axDiagnostics?.reason === "string" ? details.axDiagnostics.reason : undefined,
 		axDiagnosticMessage: typeof details?.axDiagnostics?.message === "string" ? details.axDiagnostics.message : undefined,
 		axRoles,
+		textChars,
+		imageBytes,
+		contentJsonBytes,
+		detailsJsonBytes,
+		payloadBytes: contentJsonBytes + detailsJsonBytes,
 	};
 }
 
@@ -339,8 +405,11 @@ function metrics(records: CaseRecord[]) {
 	// Core excludes capability/hybrid cases and the CDP suite: CDP checks
 	// validate the optional CDP backend, not AX coverage, so they carry no
 	// axTargets/axOnly signals and would skew the AX-quality goals.
-	const coreRecords = records.filter((record) => !record.capability && record.category !== "hybrid" && record.category !== "cdp");
-	const executed = records.filter((record) => record.status !== "SKIP");
+	const axRecords = records.filter((record) => record.category !== "cdp");
+	const cdpRecords = records.filter((record) => record.category === "cdp");
+	const coreRecords = axRecords.filter((record) => !record.capability && record.category !== "hybrid");
+	const executed = axRecords.filter((record) => record.status !== "SKIP");
+	const cdpExecuted = cdpRecords.filter((record) => record.status !== "SKIP");
 	const coreExecuted = coreRecords.filter((record) => record.status !== "SKIP");
 	const passed = executed.filter((record) => record.status === "PASS");
 	const corePassed = coreExecuted.filter((record) => record.status === "PASS");
@@ -364,6 +433,8 @@ function metrics(records: CaseRecord[]) {
 		subset.length
 			? Number((subset.reduce((sum, record) => sum + (record.axTargets ?? 0), 0) / subset.length).toFixed(1))
 			: 0;
+	const avgBytes = (subset: CaseRecord[], key: "textChars" | "imageBytes" | "contentJsonBytes" | "detailsJsonBytes" | "payloadBytes") =>
+		subset.length ? Math.round(subset.reduce((sum, record) => sum + (record[key] ?? 0), 0) / subset.length) : 0;
 	const byCategory = Object.fromEntries(
 		Array.from(new Set(records.map((record) => record.category))).map((category) => {
 			const subset = records.filter((record) => record.category === category);
@@ -382,6 +453,11 @@ function metrics(records: CaseRecord[]) {
 					sparseSemanticCoverageRatio: ratio(subset.filter((record) => record.status === "PASS"), sparseSemanticCoverage),
 					stealthCompatibleRatio: ratio(subsetExecuted, (record) => record.stealthCompatible === true),
 					avgAxTargets: avgAxTargets(subset.filter((record) => record.status === "PASS")),
+					avgTextChars: avgBytes(subset.filter((record) => record.status === "PASS"), "textChars"),
+					avgImageBytes: avgBytes(subset.filter((record) => record.status === "PASS"), "imageBytes"),
+					avgContentJsonBytes: avgBytes(subset.filter((record) => record.status === "PASS"), "contentJsonBytes"),
+					avgDetailsJsonBytes: avgBytes(subset.filter((record) => record.status === "PASS"), "detailsJsonBytes"),
+					avgPayloadBytes: avgBytes(subset.filter((record) => record.status === "PASS"), "payloadBytes"),
 					avgLatencyMs: avgLatency(subsetExecuted),
 				},
 			];
@@ -389,12 +465,22 @@ function metrics(records: CaseRecord[]) {
 	);
 	const hybridPassed = passed.filter((record) => record.category === "hybrid");
 	const hybridExecuted = executed.filter((record) => record.category === "hybrid");
+	const executedApps = new Set(executed.map((record) => record.app).filter(Boolean));
+	const executedCategories = new Set(executed.map((record) => record.category));
+	const executedTools = new Set(executed.map((record) => record.tool));
 	return {
-		total: records.length,
+		total: axRecords.length,
 		executed: executed.length,
 		passed: passed.length,
 		failed: executed.filter((record) => record.status === "FAIL").length,
-		skipped: records.filter((record) => record.status === "SKIP").length,
+		executedAppCount: executedApps.size,
+		executedCategoryCount: executedCategories.size,
+		executedToolCount: executedTools.size,
+		skipped: axRecords.filter((record) => record.status === "SKIP").length,
+		cdpTotal: cdpRecords.length,
+		cdpExecuted: cdpExecuted.length,
+		cdpPassed: cdpExecuted.filter((record) => record.status === "PASS").length,
+		cdpFailed: cdpExecuted.filter((record) => record.status === "FAIL").length,
 		axOnlyRatio: ratio(executed, (record) => record.axOnly === true),
 		coreAxOnlyRatio: ratio(coreExecuted, (record) => record.axOnly === true),
 		visionFallbackRatio: ratio(executed, (record) => record.hasImage === true),
@@ -431,6 +517,17 @@ function metrics(records: CaseRecord[]) {
 		avgTargetingLatencyMs: avgLatency(targeting),
 		avgPrimitiveLatencyMs: avgLatency(primitives),
 		avgBatchLatencyMs: avgLatency(batches),
+		avgTextChars: avgBytes(passed, "textChars"),
+		coreAvgTextChars: avgBytes(corePassed, "textChars"),
+		hybridAvgTextChars: avgBytes(hybridPassed, "textChars"),
+		avgImageBytes: avgBytes(passed, "imageBytes"),
+		coreAvgImageBytes: avgBytes(corePassed, "imageBytes"),
+		hybridAvgImageBytes: avgBytes(hybridPassed, "imageBytes"),
+		avgContentJsonBytes: avgBytes(passed, "contentJsonBytes"),
+		avgDetailsJsonBytes: avgBytes(passed, "detailsJsonBytes"),
+		avgPayloadBytes: avgBytes(passed, "payloadBytes"),
+		coreAvgPayloadBytes: avgBytes(corePassed, "payloadBytes"),
+		hybridAvgPayloadBytes: avgBytes(hybridPassed, "payloadBytes"),
 		coverage: byCategory,
 	};
 }
@@ -458,11 +555,17 @@ function compactCase(record: CaseRecord) {
 		axDiagnosticReason: record.axDiagnosticReason,
 		details: record.details,
 		capability: record.capability,
+		textChars: record.textChars,
+		imageBytes: record.imageBytes,
+		contentJsonBytes: record.contentJsonBytes,
+		detailsJsonBytes: record.detailsJsonBytes,
+		payloadBytes: record.payloadBytes,
 	};
 }
 
 function analyzeRecords(records: CaseRecord[]) {
-	const executed = records.filter((record) => record.status !== "SKIP");
+	const axRecords = records.filter((record) => record.category !== "cdp");
+	const executed = axRecords.filter((record) => record.status !== "SKIP");
 	const passed = executed.filter((record) => record.status === "PASS");
 	const semanticCoverageOk = (record: CaseRecord) => record.status === "PASS" && record.hasImage !== true && (record.axTargets ?? 0) >= 3;
 	const sparseSemanticCoverage = (record: CaseRecord) => record.status === "PASS" && (record.hasImage === true || (record.axTargets ?? 0) < 3);
@@ -498,7 +601,7 @@ function analyzeRecords(records: CaseRecord[]) {
 	const nonAxTargetingCases = passed
 		.filter((record) => ["click", "set_text", "scroll", "drag"].includes(record.tool) && record.axExecution !== true)
 		.map(compactCase);
-	const skippedCapabilities = records
+	const skippedCapabilities = axRecords
 		.filter((record) => record.status === "SKIP" && Boolean(record.capability))
 		.map(compactCase);
 	const failedCases = records
@@ -567,8 +670,13 @@ async function benchmarkCase(
 				fallbackUsed: summary.fallbackUsed,
 				stealthCompatible: summary.stealthCompatible,
 				executionVariant: summary.executionVariant,
-				details: `axTargets=${summary.axTargets} hasImage=${summary.hasImage}${summary.imageReason ? ` imageReason=${summary.imageReason}` : ""} axExecution=${summary.axExecution} fallback=${summary.fallbackUsed} variant=${summary.executionVariant} stealthCompatible=${summary.stealthCompatible}${summary.axDiagnosticReason ? ` axDiagnostic=${summary.axDiagnosticReason}` : ""}`,
+					details: `axTargets=${summary.axTargets} hasImage=${summary.hasImage}${summary.imageReason ? ` imageReason=${summary.imageReason}` : ""} axExecution=${summary.axExecution} fallback=${summary.fallbackUsed} variant=${summary.executionVariant} stealthCompatible=${summary.stealthCompatible} textChars=${summary.textChars} imageBytes=${summary.imageBytes} payloadBytes=${summary.payloadBytes}${summary.axDiagnosticReason ? ` axDiagnostic=${summary.axDiagnosticReason}` : ""}`,
 				capability,
+				textChars: summary.textChars,
+				imageBytes: summary.imageBytes,
+				contentJsonBytes: summary.contentJsonBytes,
+				detailsJsonBytes: summary.detailsJsonBytes,
+				payloadBytes: summary.payloadBytes,
 				imageReason: summary.imageReason,
 				axDiagnosticReason: summary.axDiagnosticReason,
 				axDiagnosticMessage: summary.axDiagnosticMessage,
@@ -638,6 +746,10 @@ async function runSotaCapabilityCases(item: { app: string; category: string }, d
 	}
 
 	if (item.category === "browser") {
+		if (!ALLOW_BROWSER_NAVIGATION) {
+			records.push({ name: `${item.app}-sota-address-ax`, category: item.category, tool: "computer_actions", app: item.app, status: "SKIP", details: "Browser navigation capability is disabled by default; pass --allow-browser-navigation to run it", capability: "browser_address_ax" });
+			return;
+		}
 		const result = await benchmarkCase(
 			`${item.app}-sota-address-ax`,
 			item.category,
@@ -673,6 +785,7 @@ async function main() {
 
 	ensureHelperCurrent();
 	const records: CaseRecord[] = [];
+	const preparedApps = new Set<string>();
 	const ctx = makeCtx();
 	const apps = runningApps();
 
@@ -690,7 +803,7 @@ async function main() {
 			}
 		}
 		if (available && ALLOW_SCREEN_TAKEOVER) {
-			prepareAppWindow(item.app);
+			if (prepareAppWindow(item.app)) preparedApps.add(item.app);
 			await sleep(250);
 		}
 		if (!available) {
@@ -752,7 +865,7 @@ async function main() {
 
 		await runSotaCapabilityCases(item, capabilityDetails, ctx, records);
 
-		if (item.app === "TextEdit" && details?.capture?.stateId) {
+		if (item.app === "TextEdit" && details?.capture?.stateId && ALLOW_SCREEN_TAKEOVER) {
 			let currentDetails = details;
 			let point = captureCenter(currentDetails);
 			await executeClick(
@@ -869,6 +982,7 @@ async function main() {
 		}
 	}
 
+	cleanupBenchmarkArtifacts(preparedApps);
 	stopBridge();
 
 	// CDP backend checks run against a self-contained headless Chrome; they
@@ -892,9 +1006,12 @@ async function main() {
 
 	const benchmarkMetrics = metrics(records);
 	const summary: BenchmarkSummary = {
+		benchmarkSchemaVersion: BENCHMARK_SCHEMA_VERSION,
 		date: new Date().toISOString(),
 		strictAxMode: STRICT_AX_MODE,
 		allowScreenTakeover: ALLOW_SCREEN_TAKEOVER,
+		allowBrowserNavigation: ALLOW_BROWSER_NAVIGATION,
+		leaveArtifacts: LEAVE_ARTIFACTS,
 		host: os.hostname(),
 		cwd: process.cwd(),
 		metrics: benchmarkMetrics,
@@ -906,7 +1023,7 @@ async function main() {
 		const baseline = readJsonFile(path.resolve(BASELINE_PATH));
 		summary.comparison = {
 			baselinePath: path.resolve(BASELINE_PATH),
-			...compareMetrics(summary.metrics, baseline.metrics),
+			...compareMetrics(summary.metrics, baseline),
 		};
 	}
 

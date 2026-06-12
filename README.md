@@ -75,7 +75,7 @@ Use `/computer-use` in Pi to inspect the effective config and config sources.
 - Browser-aware targeting that prefers a dedicated browser window for agent work.
 - Optional [CDP acceleration](./docs/configuration.md#optional-cdp-acceleration) for Chromium-family browsers: event-driven `navigate_browser` and browser console output in tool results, with no change to the tool surface.
 - Optional strict AX mode for background-safe operation without foreground focus, raw pointer events, raw keyboard events, or cursor takeover.
-- Official QA benchmark harness in [`benchmarks/`](./benchmarks/README.md).
+- Official QA benchmark harness; see [Development](./docs/development.md#benchmarks).
 
 ## Examples
 
@@ -128,9 +128,8 @@ The result is semantic-first GUI control: Pi sees useful AX targets first, falls
 
 - [Usage guide](./docs/usage.md): tool workflow, AX refs, text input, browser flows, batching, and strict AX mode.
 - [Configuration](./docs/configuration.md): config files, environment overrides, browser control, and stealth mode.
-- [Development](./docs/development.md): local setup, helper builds, validation, release signing notes, and PR workflow.
+- [Development](./docs/development.md): local setup, helper builds, benchmarks, validation, release signing notes, and PR workflow.
 - [Troubleshooting](./docs/troubleshooting.md): permissions, helper setup, stale refs, browser refusal, and strict mode errors.
-- [Benchmarks](./benchmarks/README.md): benchmark commands, metrics, regression policy, and local comparison workflow.
 - [Contributing](./CONTRIBUTING.md): issue-first contribution rules and PR checklist.
 
 ## Development & Benchmarks
@@ -159,11 +158,13 @@ Run the default QA benchmark:
 npm run benchmark:qa
 ```
 
-Run the wider benchmark that may open apps:
+Run the wider benchmark that may open apps, while still skipping browser tab navigation by default:
 
 ```bash
 npm run benchmark:qa:full
 ```
+
+Benchmark details and opt-in flags are in [Development](./docs/development.md#benchmarks).
 
 ## Release & Install Notes
 
