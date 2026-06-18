@@ -2099,15 +2099,18 @@ final class Bridge {
 	}
 
 	private func legacyWindowScreenshot(windowId: UInt32, maxDimension: Int? = nil) throws -> [String: Any]? {
+#if !PI_COMPUTER_USE_SCREEN_CAPTURE_KIT
 		if let payload = try cgWindowScreenshot(windowId: windowId, maxDimension: maxDimension) {
 			return payload
 		}
+#endif
 		if let payload = try systemScreenshotWindow(windowId: windowId, maxDimension: maxDimension) {
 			return payload
 		}
 		return nil
 	}
 
+#if !PI_COMPUTER_USE_SCREEN_CAPTURE_KIT
 	private func cgWindowScreenshot(windowId: UInt32, maxDimension: Int? = nil) throws -> [String: Any]? {
 		let options: CGWindowListOption = [.optionIncludingWindow]
 		let imageOptions: CGWindowImageOption = [.boundsIgnoreFraming, .bestResolution]
@@ -2115,6 +2118,7 @@ final class Bridge {
 		guard image.width > 1, image.height > 1 else { return nil }
 		return try screenshotPayload(image: image, windowId: windowId, maxDimension: maxDimension)
 	}
+#endif
 
 	private func systemScreenshotWindow(windowId: UInt32, maxDimension: Int? = nil) throws -> [String: Any]? {
 		let tempUrl = FileManager.default.temporaryDirectory.appendingPathComponent("pi-cu-\(UUID().uuidString).png")
