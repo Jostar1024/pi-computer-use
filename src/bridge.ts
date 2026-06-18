@@ -631,6 +631,8 @@ const BROWSER_WINDOW_OPEN_TIMEOUT_MS = 10_000;
 const BROWSER_CONTEXT_PREFIX = "browser:";
 const DESKTOP_CONTEXT_PREFIX = "desktop:";
 const MANAGED_BROWSER_READY_TIMEOUT_MS = 15_000;
+const AUTO_IMAGE_MAX_DIMENSION = 1_000;
+const EXPLICIT_IMAGE_MAX_DIMENSION = 1_600;
 const HELIUM_EXECUTABLE = "/Applications/Helium.app/Contents/MacOS/Helium";
 const CHROME_EXECUTABLE = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 
@@ -2072,10 +2074,10 @@ async function ensureTargetWindowId(target: ResolvedTarget, signal?: AbortSignal
 	return refreshed;
 }
 
-async function helperScreenshot(windowId: number, signal?: AbortSignal): Promise<ScreenshotPayload> {
+async function helperScreenshot(windowId: number, signal?: AbortSignal, maxDimension?: number): Promise<ScreenshotPayload> {
 	const result = await bridgeCommand<any>(
 		"screenshot",
-		{ windowId },
+		{ windowId, maxDimension },
 		{ timeoutMs: SCREENSHOT_TIMEOUT_MS, signal },
 	);
 
@@ -2111,6 +2113,7 @@ async function recoverCaptureFromHelperFailure(
 	target: ResolvedTarget,
 	error: HelperCommandError,
 	signal?: AbortSignal,
+	maxDimension?: number,
 ): Promise<{ target: ResolvedTarget; image: ScreenshotPayload }> {
 	const windows = await listWindows(target.pid, signal);
 	if (!windows.length) {
@@ -2133,7 +2136,7 @@ async function recoverCaptureFromHelperFailure(
 	for (const candidateWindow of candidates) {
 		const candidateTarget = toResolvedTarget(app, candidateWindow);
 		try {
-			const image = await helperScreenshot(candidateTarget.windowId, signal);
+			const image = await helperScreenshot(candidateTarget.windowId, signal, maxDimension);
 			return { target: candidateTarget, image };
 		} catch (candidateError) {
 			if (!isRecoverableScreenshotError(candidateError)) {
@@ -2165,10 +2168,10 @@ function captureForTarget(target: ResolvedTarget): CurrentCapture {
 	};
 }
 
-async function ensureCaptureImage(result: CaptureResult, signal?: AbortSignal): Promise<void> {
+async function ensureCaptureImage(result: CaptureResult, signal?: AbortSignal, maxDimension = AUTO_IMAGE_MAX_DIMENSION): Promise<void> {
 	if (result.image) return;
 	try {
-		result.image = await helperScreenshot(result.target.windowId, signal);
+		result.image = await helperScreenshot(result.target.windowId, signal, maxDimension);
 		result.capture.width = result.image.width;
 		result.capture.height = result.image.height;
 		result.capture.scaleFactor = result.image.scaleFactor;
@@ -2180,7 +2183,7 @@ async function ensureCaptureImage(result: CaptureResult, signal?: AbortSignal): 
 			}
 			throw normalized;
 		}
-		const recovered = await recoverCaptureFromHelperFailure(result.target, error, signal);
+		const recovered = await recoverCaptureFromHelperFailure(result.target, error, signal, maxDimension);
 		result.target = recovered.target;
 		result.image = recovered.image;
 		result.capture.width = recovered.image.width;
@@ -2229,7 +2232,7 @@ async function buildToolResult(
 ): Promise<AgentToolResult<ComputerUseDetails>> {
 	const fallbackReason = imageFallbackReason(tool, result, execution, imageMode);
 	if (fallbackReason) {
-		await ensureCaptureImage(result, signal);
+		await ensureCaptureImage(result, signal, imageMode === "always" ? EXPLICIT_IMAGE_MAX_DIMENSION : AUTO_IMAGE_MAX_DIMENSION);
 	}
 
 	const details: ComputerUseDetails = {
