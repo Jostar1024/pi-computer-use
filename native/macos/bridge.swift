@@ -722,7 +722,8 @@ final class Bridge {
 
 	private func screenshot(_ request: [String: Any]) throws -> [String: Any] {
 		let windowId = UInt32(try intArg(request, "windowId"))
-		return try captureWindow(windowId: windowId)
+		let maxDimension = optionalIntArg(request, "maxDimension").map { max(1, $0) }
+		return try captureWindow(windowId: windowId, maxDimension: maxDimension)
 	}
 
 	private func mouseClick(_ request: [String: Any]) throws -> [String: Any] {
@@ -1926,7 +1927,7 @@ final class Bridge {
 		return scale > 0 ? scale : 1.0
 	}
 
-	private func captureWindow(windowId: UInt32) throws -> [String: Any] {
+	private func captureWindow(windowId: UInt32, maxDimension: Int? = nil) throws -> [String: Any] {
 #if PI_COMPUTER_USE_SCREEN_CAPTURE_KIT
 		if #available(macOS 14.0, *) {
 			let semaphore = DispatchSemaphore(value: 0)
@@ -1958,14 +1959,14 @@ final class Bridge {
 
 			if semaphore.wait(timeout: .now() + .seconds(8)) == .timedOut {
 				task.cancel()
-				if let payload = try legacyWindowScreenshot(windowId: windowId) {
+				if let payload = try legacyWindowScreenshot(windowId: windowId, maxDimension: maxDimension) {
 					return payload
 				}
 				throw BridgeFailure(message: "Screenshot timed out while capturing window \(windowId)", code: "screenshot_timeout")
 			}
 
 			if let error = capturedError.value {
-				if let payload = try legacyWindowScreenshot(windowId: windowId) {
+				if let payload = try legacyWindowScreenshot(windowId: windowId, maxDimension: maxDimension) {
 					return payload
 				}
 				if let failure = error as? BridgeFailure {
@@ -1975,56 +1976,76 @@ final class Bridge {
 			}
 
 			guard let image = capturedImage.value else {
-				if let payload = try legacyWindowScreenshot(windowId: windowId) {
+				if let payload = try legacyWindowScreenshot(windowId: windowId, maxDimension: maxDimension) {
 					return payload
 				}
 				throw BridgeFailure(message: "Screenshot failed", code: "screenshot_failed")
 			}
 
-			return try screenshotPayload(image: image, windowId: windowId)
+			return try screenshotPayload(image: image, windowId: windowId, maxDimension: maxDimension)
 		}
 #endif
-		if let payload = try legacyWindowScreenshot(windowId: windowId) {
+		if let payload = try legacyWindowScreenshot(windowId: windowId, maxDimension: maxDimension) {
 			return payload
 		}
 		throw BridgeFailure(message: "Screenshot failed", code: "screenshot_failed")
 	}
 
-	private func screenshotPayload(image: CGImage, windowId: UInt32) throws -> [String: Any] {
-		guard let pngData = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
+	private func screenshotPayload(image: CGImage, windowId: UInt32, maxDimension: Int? = nil) throws -> [String: Any] {
+		let outputImage = downscaledImage(image, maxDimension: maxDimension) ?? image
+		guard let pngData = NSBitmapImageRep(cgImage: outputImage).representation(using: .png, properties: [:]) else {
 			throw BridgeFailure(message: "Failed to encode screenshot as PNG", code: "encoding_failed")
 		}
 
 		let bounds = currentWindowBounds(windowId: windowId)
-		let scale = bounds.map { displayScaleFactor(for: $0) } ?? 1.0
+		let scale = bounds.map { $0.width > 0 ? Double(outputImage.width) / $0.width : displayScaleFactor(for: $0) } ?? 1.0
 
 		return [
 			"pngBase64": pngData.base64EncodedString(),
-			"width": image.width,
-			"height": image.height,
+			"width": outputImage.width,
+			"height": outputImage.height,
 			"scaleFactor": scale,
 		]
 	}
 
-	private func legacyWindowScreenshot(windowId: UInt32) throws -> [String: Any]? {
-		if let payload = try cgWindowScreenshot(windowId: windowId) {
+	private func downscaledImage(_ image: CGImage, maxDimension: Int?) -> CGImage? {
+		guard let maxDimension, max(image.width, image.height) > maxDimension else { return nil }
+		let scale = Double(maxDimension) / Double(max(image.width, image.height))
+		let width = max(1, Int(Double(image.width) * scale))
+		let height = max(1, Int(Double(image.height) * scale))
+		guard let context = CGContext(
+			data: nil,
+			width: width,
+			height: height,
+			bitsPerComponent: image.bitsPerComponent,
+			bytesPerRow: 0,
+			space: image.colorSpace ?? CGColorSpaceCreateDeviceRGB(),
+			bitmapInfo: image.bitmapInfo.rawValue
+		) else { return nil }
+		context.interpolationQuality = .medium
+		context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+		return context.makeImage()
+	}
+
+	private func legacyWindowScreenshot(windowId: UInt32, maxDimension: Int? = nil) throws -> [String: Any]? {
+		if let payload = try cgWindowScreenshot(windowId: windowId, maxDimension: maxDimension) {
 			return payload
 		}
-		if let payload = try systemScreenshotWindow(windowId: windowId) {
+		if let payload = try systemScreenshotWindow(windowId: windowId, maxDimension: maxDimension) {
 			return payload
 		}
 		return nil
 	}
 
-	private func cgWindowScreenshot(windowId: UInt32) throws -> [String: Any]? {
+	private func cgWindowScreenshot(windowId: UInt32, maxDimension: Int? = nil) throws -> [String: Any]? {
 		let options: CGWindowListOption = [.optionIncludingWindow]
 		let imageOptions: CGWindowImageOption = [.boundsIgnoreFraming, .bestResolution]
 		guard let image = CGWindowListCreateImage(.null, options, CGWindowID(windowId), imageOptions) else { return nil }
 		guard image.width > 1, image.height > 1 else { return nil }
-		return try screenshotPayload(image: image, windowId: windowId)
+		return try screenshotPayload(image: image, windowId: windowId, maxDimension: maxDimension)
 	}
 
-	private func systemScreenshotWindow(windowId: UInt32) throws -> [String: Any]? {
+	private func systemScreenshotWindow(windowId: UInt32, maxDimension: Int? = nil) throws -> [String: Any]? {
 		let tempUrl = FileManager.default.temporaryDirectory.appendingPathComponent("pi-cu-\(UUID().uuidString).png")
 		defer { try? FileManager.default.removeItem(at: tempUrl) }
 		// Owner-only perms in case TMPDIR ever resolves to a shared directory.
@@ -2047,7 +2068,7 @@ final class Bridge {
 		guard process.terminationStatus == 0 else { return nil }
 		guard let data = try? Data(contentsOf: tempUrl), !data.isEmpty else { return nil }
 		guard let imageRep = NSBitmapImageRep(data: data), let cgImage = imageRep.cgImage else { return nil }
-		return try screenshotPayload(image: cgImage, windowId: windowId)
+		return try screenshotPayload(image: cgImage, windowId: windowId, maxDimension: maxDimension)
 	}
 
 	private func currentWindowBounds(windowId: UInt32) -> CGRect? {
