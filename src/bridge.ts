@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult, AgentToolUpdateCallback, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { cdpClickForContext, cdpEvaluateForContext, cdpNavigateContext, cdpScrollForContext, cdpSnapshotForContext, cdpTabForWindow, cdpTypeForContext, listCdpPageContexts, type CdpConsoleEntry, type CdpPageSnapshot } from "./cdp.ts";
-import { getComputerUseConfig, isBrowserUseEnabled, isStrictAxMode, loadComputerUseConfig } from "./config.ts";
+import { getComputerUseConfig, getScreenshotMaxDimension, isBrowserUseEnabled, isStrictAxMode, loadComputerUseConfig } from "./config.ts";
 import { ensurePermissions, type PermissionStatus } from "./permissions.ts";
 
 type WindowSelector = string | number;
@@ -653,6 +653,11 @@ const DESKTOP_CONTEXT_PREFIX = "desktop:";
 const MANAGED_BROWSER_READY_TIMEOUT_MS = 15_000;
 const AUTO_IMAGE_MAX_DIMENSION = 1_000;
 const EXPLICIT_IMAGE_MAX_DIMENSION = 1_600;
+
+function resolveMaxDimension(fallback: number): number {
+	const configured = getScreenshotMaxDimension();
+	return configured > 0 ? configured : fallback;
+}
 const AX_TARGET_TEXT_PREVIEW_CHARS = 240;
 const BROWSER_SNAPSHOT_TEXT_PREVIEW_CHARS = 2_000;
 const HELIUM_EXECUTABLE = "/Applications/Helium.app/Contents/MacOS/Helium";
@@ -2259,7 +2264,7 @@ async function buildToolResult(
 ): Promise<AgentToolResult<ComputerUseDetails>> {
 	const fallbackReason = imageFallbackReason(tool, result, execution, imageMode);
 	if (fallbackReason) {
-		await ensureCaptureImage(result, signal, imageMode === "always" ? EXPLICIT_IMAGE_MAX_DIMENSION : AUTO_IMAGE_MAX_DIMENSION);
+		await ensureCaptureImage(result, signal, imageMode === "always" ? resolveMaxDimension(EXPLICIT_IMAGE_MAX_DIMENSION) : resolveMaxDimension(AUTO_IMAGE_MAX_DIMENSION));
 	}
 
 	const details: ComputerUseDetails = {

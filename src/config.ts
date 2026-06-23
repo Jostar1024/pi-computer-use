@@ -5,6 +5,7 @@ import { getAgentDir } from "@earendil-works/pi-coding-agent";
 export interface ComputerUseConfig {
 	browser_use: boolean;
 	stealth_mode: boolean;
+	screenshot_max_dimension: number;
 }
 
 export interface ComputerUseConfigSource {
@@ -23,6 +24,7 @@ export interface LoadedComputerUseConfig {
 const DEFAULT_CONFIG: ComputerUseConfig = {
 	browser_use: true,
 	stealth_mode: false,
+	screenshot_max_dimension: 0,
 };
 
 let activeConfig: ComputerUseConfig = { ...DEFAULT_CONFIG };
@@ -46,6 +48,8 @@ function normalizePartial(raw: unknown): Partial<ComputerUseConfig> {
 	const stealthMode = parseBoolean((source as any).stealth_mode ?? (source as any).stealthMode);
 	if (browserUse !== undefined) out.browser_use = browserUse;
 	if (stealthMode !== undefined) out.stealth_mode = stealthMode;
+	const maxDim = (source as any).screenshot_max_dimension ?? (source as any).screenshotMaxDimension;
+	if (typeof maxDim === "number" && Number.isFinite(maxDim) && maxDim > 0) out.screenshot_max_dimension = Math.trunc(maxDim);
 	return out;
 }
 
@@ -67,6 +71,11 @@ function readEnv(): Partial<ComputerUseConfig> {
 	if (stealthMode !== undefined) out.stealth_mode = stealthMode;
 	if (parseBoolean(process.env.PI_COMPUTER_USE_STEALTH) === true || parseBoolean(process.env.PI_COMPUTER_USE_STRICT_AX) === true) {
 		out.stealth_mode = true;
+	}
+	const envMaxDim = process.env.PI_COMPUTER_USE_SCREENSHOT_MAX_DIMENSION;
+	if (envMaxDim) {
+		const parsed = Number(envMaxDim);
+		if (Number.isFinite(parsed) && parsed > 0) out.screenshot_max_dimension = Math.trunc(parsed);
 	}
 	return out;
 }
@@ -101,4 +110,8 @@ export function isStrictAxMode(): boolean {
 
 export function isBrowserUseEnabled(): boolean {
 	return activeConfig.browser_use;
+}
+
+export function getScreenshotMaxDimension(): number {
+	return activeConfig.screenshot_max_dimension;
 }
